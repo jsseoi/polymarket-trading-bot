@@ -70,7 +70,7 @@ class MMDataCollector(DataFetcher):
         min_volume_24h: float = 10_000,
         min_liquidity: float = 5_000,
         min_days_to_expiry: int = 7,
-        max_markets: int = 200,
+        max_markets: int = 50,
         categories: Optional[List[str]] = None,
     ) -> List[MarketInfo]:
         """
@@ -82,16 +82,19 @@ class MMDataCollector(DataFetcher):
         - Active, not resolved
         - Optionally filter by category (politics, crypto, etc.)
         """
-        all_raw = self.fetch_all_markets(include_closed=False, max_markets=max_markets)
+        import json as _json
+
+        # Fetch large pool, then filter down
+        all_raw = self.fetch_all_markets(include_closed=False, max_markets=1000)
 
         now = datetime.now()
         suitable = []
 
         for m in all_raw:
-            # Parse basic fields
-            volume_24h = float(m.get("volume24hr", 0) or 0)
-            liquidity = float(m.get("liquidity", 0) or 0)
-            volume = float(m.get("volume", 0) or 0)
+            # Parse basic fields (API returns camelCase)
+            volume_24h = float(m.get("volume24hr", m.get("volume24hrClob", 0)) or 0)
+            liquidity = float(m.get("liquidityClob", m.get("liquidity", 0)) or 0)
+            volume = float(m.get("volumeClob", m.get("volume", 0)) or 0)
             active = m.get("active", False)
             closed = m.get("closed", False)
 
@@ -102,12 +105,17 @@ class MMDataCollector(DataFetcher):
             if liquidity < min_liquidity:
                 continue
 
-            # Check expiry
-            end_date_str = m.get("end_date_iso") or m.get("endDate")
+            # Check expiry (API returns endDateIso or endDate)
+            end_date_str = m.get("endDateIso") or m.get("endDate") or m.get("end_date_iso")
             if end_date_str:
                 try:
-                    end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                    days_to_expiry = (end_date - now.astimezone(end_date.tzinfo)).days
+                    # endDateIso is often just "YYYY-MM-DD", endDate has timezone
+                    cleaned = end_date_str.replace("Z", "+00:00")
+                    if "T" not in cleaned and len(cleaned) == 10:
+                        cleaned += "T00:00:00+00:00"
+                    end_date = datetime.fromisoformat(cleaned)
+                    end_naive = end_date.replace(tzinfo=None)
+                    days_to_expiry = (end_naive - now).days
                     if days_to_expiry < min_days_to_expiry:
                         continue
                 except (ValueError, TypeError):
@@ -118,11 +126,19 @@ class MMDataCollector(DataFetcher):
             if categories and category and category.lower() not in [c.lower() for c in categories]:
                 continue
 
-            # Extract token IDs
+            # Extract token IDs (clobTokenIds is a JSON array string)
             tokens = m.get("tokens", [])
-            clob_ids = m.get("clobTokenIds", "")
-            if isinstance(clob_ids, str):
-                clob_ids = [t.strip() for t in clob_ids.split(",") if t.strip()]
+            clob_ids_raw = m.get("clobTokenIds", "")
+            clob_ids = []
+            if isinstance(clob_ids_raw, str) and clob_ids_raw.startswith("["):
+                try:
+                    clob_ids = _json.loads(clob_ids_raw)
+                except _json.JSONDecodeError:
+                    clob_ids = []
+            elif isinstance(clob_ids_raw, list):
+                clob_ids = clob_ids_raw
+            elif isinstance(clob_ids_raw, str) and clob_ids_raw:
+                clob_ids = [t.strip() for t in clob_ids_raw.split(",") if t.strip()]
 
             yes_token = ""
             no_token = ""
@@ -137,7 +153,7 @@ class MMDataCollector(DataFetcher):
                 continue
 
             suitable.append(MarketInfo(
-                condition_id=m.get("condition_id", m.get("id", "")),
+                condition_id=m.get("conditionId", m.get("condition_id", m.get("id", ""))),
                 question=m.get("question", ""),
                 yes_token_id=yes_token,
                 no_token_id=no_token,
@@ -167,7 +183,7 @@ class MMDataCollector(DataFetcher):
         Fetch hourly price history from CLOB /prices-history.
 
         Args:
-            token_id: Token contract address
+            token_id: Token contract address (CLOB asset ID)
             interval: Time interval (1m, 5m, 1h, 1d)
             fidelity: Data fidelity in minutes
 
@@ -175,9 +191,9 @@ class MMDataCollector(DataFetcher):
             List of {t: timestamp, p: price} dicts
         """
         params = {
-            "tokenID": token_id,
-            "interval": interval,
-            "fidelity": fidelity,
+            "market": token_id,
+            "interval": "max",
+            "fidelity": 1,
         }
 
         try:
