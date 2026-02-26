@@ -174,13 +174,23 @@ class GammaClient:
         # Parse outcomes and prices
         outcomes = data.get("outcomes", ["Yes", "No"])
         if isinstance(outcomes, str):
-            outcomes = outcomes.split(",")
+            import json as _json
+            try:
+                outcomes = _json.loads(outcomes)
+            except (ValueError, _json.JSONDecodeError):
+                outcomes = outcomes.split(",")
         
         outcome_prices = []
         if "outcomePrices" in data:
             prices = data["outcomePrices"]
             if isinstance(prices, str):
-                outcome_prices = [float(p) for p in prices.split(",")]
+                # API returns JSON array string like '["0.49", "0.51"]'
+                import json as _json
+                try:
+                    parsed = _json.loads(prices)
+                    outcome_prices = [float(p) for p in parsed]
+                except (ValueError, _json.JSONDecodeError):
+                    outcome_prices = [float(p) for p in prices.split(",")]
             elif isinstance(prices, list):
                 outcome_prices = [float(p) for p in prices]
         
