@@ -41,6 +41,14 @@ class MMBacktestConfig(BacktestConfig):
     # Fee config (overrides strategy's if set)
     fee_config: Optional[FeeConfig] = None
 
+    # Adverse selection: penalty applied to fill price when order is hit
+    # Models the fact that fills happen when informed traders trade against you.
+    # A value of 0.3 means 30% of the spread is lost to adverse selection on average.
+    adverse_selection_factor: float = 0.3
+
+    # Whether to separate resolution profit from spread capture in metrics
+    separate_resolution_profit: bool = True
+
 
 @dataclass
 class FillEvent:
@@ -66,6 +74,11 @@ class MMBacktestResult(BacktestResult):
     avg_inventory_time_hours: float = 0.0
     fills: List[Dict[str, Any]] = field(default_factory=list)
 
+    # Adverse selection tracking
+    total_adverse_selection_cost: float = 0.0
+    resolution_profit: float = 0.0  # Profit from markets resolving (directional, not spread)
+    pure_spread_profit: float = 0.0  # Spread capture minus adverse selection
+
     def mm_summary(self) -> str:
         """Market-making specific summary."""
         base = self.summary()
@@ -73,6 +86,9 @@ class MMBacktestResult(BacktestResult):
 ║  MARKET MAKING METRICS
 ║  ───────────────────────────────────────────────────────────
 ║  Total Spread Captured:  ${self.total_spread_captured:>10,.2f}
+║  Adverse Selection Cost: ${self.total_adverse_selection_cost:>10,.2f}
+║  Pure Spread Profit:     ${self.pure_spread_profit:>10,.2f}
+║  Resolution Profit:      ${self.resolution_profit:>10,.2f}
 ║  Total Maker Rebates:    ${self.total_maker_rebates:>10,.2f}
 ║  Total Volume Traded:    ${self.total_volume:>10,.2f}
 ║  Fill Rate:               {self.fill_rate:>10.1%}
@@ -122,6 +138,8 @@ class MarketMakingEngine(BacktestEngine):
         strategy.trades_by_market.clear()
 
         fee_config = config.fee_config or strategy.params.fee_config
+        total_adverse_cost = 0.0
+        total_resolution_profit = 0.0
 
         # Filter and sort snapshots
         snapshots = sorted(
@@ -183,7 +201,8 @@ class MarketMakingEngine(BacktestEngine):
                         spread_captured=pnl,
                     )
                     all_fills.append(fill)
-                    strategy.total_spread_captured += max(0, pnl)
+                    # Track resolution profit separately from spread capture
+                    total_resolution_profit += pnl
                     inv.position = 0.0
                     inv.avg_price = 0.0
                     inv.cost_basis = 0.0
@@ -246,9 +265,17 @@ class MarketMakingEngine(BacktestEngine):
                             prev_price, curr_price, vol, config,
                         )
                         if filled:
+                            # Adverse selection: when our bid fills, price likely
+                            # moves further against us. Apply a cost proportional
+                            # to the spread and the adverse_selection_factor.
+                            spread = (quote.ask_price or quote.bid_price + 0.02) - quote.bid_price
+                            as_cost = spread * config.adverse_selection_factor * quote.bid_size
+                            total_adverse_cost += as_cost
+
                             # Maker fill: no fee + rebate
                             rebate = fee_config.maker_rebate(quote.bid_price) * cost
                             strategy.state.capital -= cost
+                            strategy.state.capital -= as_cost  # Adverse selection penalty
                             strategy.state.capital += rebate
                             inv.add(quote.bid_size, quote.bid_price)
                             strategy.total_maker_rebates += rebate
@@ -263,7 +290,7 @@ class MarketMakingEngine(BacktestEngine):
                                 side="BUY",
                                 price=quote.bid_price,
                                 size=quote.bid_size,
-                                fee=-rebate,
+                                fee=-rebate + as_cost,  # Net cost including AS
                                 spread_captured=0.0,
                             ))
                             total_fills += 1
@@ -279,9 +306,15 @@ class MarketMakingEngine(BacktestEngine):
                         prev_price, curr_price, vol, config,
                     )
                     if filled:
+                        # Adverse selection on sell side: when our ask fills,
+                        # price may have moved up further (we sold too cheap)
+                        spread = quote.ask_price - (quote.bid_price or quote.ask_price - 0.02)
+                        as_cost = spread * config.adverse_selection_factor * sell_contracts
+                        total_adverse_cost += as_cost
+
                         rebate = fee_config.maker_rebate(quote.ask_price) * proceeds
                         spread_earned = (quote.ask_price - inv.avg_price) * sell_contracts
-                        strategy.state.capital += proceeds + rebate
+                        strategy.state.capital += proceeds + rebate - as_cost
                         inv.remove(sell_contracts)
                         strategy.total_maker_rebates += rebate
                         strategy.total_spread_captured += max(0, spread_earned)
@@ -293,8 +326,8 @@ class MarketMakingEngine(BacktestEngine):
                             side="SELL",
                             price=quote.ask_price,
                             size=sell_contracts,
-                            fee=-rebate,
-                            spread_captured=spread_earned,
+                            fee=-rebate + as_cost,
+                            spread_captured=spread_earned - as_cost,
                         ))
                         total_fills += 1
 
@@ -436,6 +469,10 @@ class MarketMakingEngine(BacktestEngine):
                 "price": f.price,
                 "size": f.size,
             } for f in all_fills],
+            # Adverse selection tracking
+            total_adverse_selection_cost=total_adverse_cost,
+            resolution_profit=total_resolution_profit,
+            pure_spread_profit=strategy.total_spread_captured - total_adverse_cost,
         )
 
     def _check_fill(
